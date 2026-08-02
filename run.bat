@@ -1,0 +1,1 @@
+.\dist\git_history_native
