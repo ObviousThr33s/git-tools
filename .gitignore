@@ -6,3 +6,6 @@ dist/
 # Python
 __pycache__/
 *.py[cod]
+
+# Installed binary, built from git-history-rs
+bin/

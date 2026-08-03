@@ -1,0 +1,4 @@
+/target
+# Vendored crates are ~300 MB. They are a transfer artefact for air-gapped
+# machines, not source -- regenerate with tools\vendor.ps1 when you need one.
+/vendor
