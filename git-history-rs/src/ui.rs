@@ -11,7 +11,7 @@ use crate::sigil;
 use crate::source::{Source, SourceError};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::DefaultTerminal;
+use ratatui::Terminal;
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
@@ -30,6 +30,23 @@ const DEL: Color = Color::Indexed(203);
 
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
+}
+
+/// A tint per file role. Deliberately not ADD (114): the tag shares a row
+/// with `+N` in that colour, and the eye would read the two as one thing.
+fn role_tint(r: Role) -> Color {
+    match r {
+        Role::Source => ACCENT,
+        Role::Test => Color::Indexed(149),
+        Role::Docs => Color::DarkGray,
+        Role::Config => Color::Indexed(180),
+        Role::Build => Color::Indexed(69),
+        Role::Shader => Color::Indexed(141),
+        Role::Markup => Color::Indexed(209),
+        Role::Data => Color::Indexed(45),
+        Role::Asset => Color::Indexed(104),
+        Role::Other => Color::DarkGray,
+    }
 }
 
 fn frame_block<'a>(title: Line<'a>, right: Line<'a>) -> Block<'a> {
@@ -71,6 +88,9 @@ pub struct DetailView {
     pub repo: String,
     pub commit: Commit,
     pub detail: Option<Detail>,
+    /// Built once when the screen opens, never in draw -- draw runs on every
+    /// keystroke, and this is pure work over a fixed input.
+    pub portrait: Option<Portrait>,
     pub scroll: u16,
 }
 
@@ -151,7 +171,10 @@ impl App {
         }
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    pub fn run<B>(&mut self, terminal: &mut Terminal<B>) -> std::io::Result<()>
+    where
+        B: Backend<Error = std::io::Error>,
+    {
         while self.running && !self.stack.is_empty() {
             terminal.draw(|f| self.draw(f))?;
             if let Event::Key(key) = event::read()? {
@@ -167,7 +190,10 @@ impl App {
         Ok(())
     }
 
-    fn act(&mut self, action: Action, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+    pub fn act<B>(&mut self, action: Action, terminal: &mut Terminal<B>) -> std::io::Result<()>
+    where
+        B: Backend<Error = std::io::Error>,
+    {
         match action {
             Action::None => {}
             Action::Quit => self.running = false,
@@ -256,10 +282,12 @@ impl App {
                     let repo = c.repo.clone();
                     self.splash(terminal, &format!("reading {}…", commit.short()))?;
                     let detail = self.source.detail(&repo, &commit).ok();
+                    let portrait = detail.as_ref().map(|d| d.portrait(&commit));
                     self.stack.push(Screen::Detail(DetailView {
                         repo,
                         commit,
                         detail,
+                        portrait,
                         scroll: 0,
                     }));
                 }
@@ -291,7 +319,10 @@ impl App {
         Ok(())
     }
 
-    fn splash(&self, terminal: &mut DefaultTerminal, message: &str) -> std::io::Result<()> {
+    fn splash<B>(&self, terminal: &mut Terminal<B>, message: &str) -> std::io::Result<()>
+    where
+        B: Backend<Error = std::io::Error>,
+    {
         terminal.draw(|f| {
             let area = centred(f.area(), 60, 3);
             f.render_widget(Clear, area);
@@ -306,7 +337,7 @@ impl App {
     }
 
     // -- input
-    fn handle(&mut self, key: KeyEvent) -> Action {
+    pub fn handle(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
@@ -341,7 +372,10 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Enter => {
                 return Action::Pop
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Quit,
+            // q walks back a frame rather than leaving. Only the root screen
+            // quits on q -- see handle_repos. Detail and Week both always have a
+            // parent, so neither can empty the stack from here.
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Pop,
             _ => {}
         }
         Action::None
@@ -455,14 +489,17 @@ impl App {
                 }
                 c.filter.clear();
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Quit,
+            // Back, not quit. A filter open here swallows q as text before this
+            // arm is ever reached (see the filtering branch at the top), so a
+            // typed q still types a q.
+            KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Pop,
             _ => {}
         }
         Action::None
     }
 
     // -- drawing
-    fn draw(&mut self, f: &mut Frame) {
+    pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
         let label = self.source.label();
         let has_model = self.narrator.is_some();
@@ -696,7 +733,7 @@ fn draw_commits(f: &mut Frame, area: Rect, c: &mut CommitList) {
     if c.filtering {
         hint_bar(f, rows[1], &format!("/{}▏", c.filter), &counter);
     } else {
-        hint_bar(f, rows[1], "↑↓ move   ⏎ detail   / filter   esc back", &counter);
+        hint_bar(f, rows[1], "↑↓ move   ⏎ detail   / filter   esc/q back", &counter);
     }
     c.state = state;
 }
@@ -739,16 +776,40 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut DetailView) {
             text.push(Line::from(Span::styled(para.to_string(), Style::default().fg(IDLE))));
         }
     }
+    // The portrait sits above the file list because it is the summary of it.
+    // These lines are counted, not generated -- same standing as the week
+    // digest, and they render with no model and no network.
+    if let Some(p) = &d.portrait {
+        if !p.sentences.is_empty() {
+            text.push(Line::from(""));
+            for s in &p.sentences {
+                text.push(Line::from(Span::styled(s.clone(), Style::default().fg(IDLE))));
+            }
+        }
+    }
+
     if let Some(det) = &d.detail {
         text.push(Line::from(""));
         text.push(Line::from(Span::styled("files", dim())));
-        for (name, a, del) in &det.files {
-            text.push(Line::from(vec![
+        // The role and motion clause is the first thing to drop when the
+        // frame is narrow: the counts are the fact, the clause is the gloss.
+        let wide = rows[0].width >= 72;
+        let notes = d.portrait.as_ref().map(|p| p.notes.as_slice()).unwrap_or(&[]);
+        for (i, (name, a, del)) in det.files.iter().enumerate() {
+            let mut spans = vec![
                 Span::styled(format!("  {name}  "), Style::default().fg(IDLE)),
                 Span::styled(format!("+{a}"), Style::default().fg(ADD)),
                 Span::raw(" "),
                 Span::styled(format!("−{del}"), Style::default().fg(DEL)),
-            ]));
+            ];
+            if wide {
+                if let Some(n) = notes.get(i) {
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(n.role.tag(), Style::default().fg(role_tint(n.role))));
+                    spans.push(Span::styled(format!(" · {}", n.motion()), dim()));
+                }
+            }
+            text.push(Line::from(spans));
         }
     }
 
@@ -758,7 +819,7 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut DetailView) {
         Paragraph::new(text).scroll((d.scroll, 0)).wrap(Wrap { trim: false }),
         rows[0],
     );
-    hint_bar(f, rows[1], "↑↓ scroll   esc back   q quit",
+    hint_bar(f, rows[1], "↑↓ scroll   esc/q back",
              &format!("{}/{}", d.scroll + 1, total));
 }
 
@@ -906,9 +967,9 @@ fn draw_week(f: &mut Frame, area: Rect, w: &mut WeekView, has_model: bool) {
     );
 
     let hint = if has_model {
-        "↑↓ scroll   p/n week   m narrate   esc back"
+        "↑↓ scroll   p/n week   m narrate   esc/q back"
     } else {
-        "↑↓ scroll   p/n week   esc back   q quit"
+        "↑↓ scroll   p/n week   esc/q back"
     };
     hint_bar(f, rows[1], hint, &format!("{}/{}", w.scroll + 1, total));
 }

@@ -36,6 +36,10 @@ pub struct Detail {
     pub additions: i64,
     pub deletions: i64,
     pub files: Vec<(String, i64, i64)>,
+    /// From `--summary`, keyed by final path. Absent for a source that cannot
+    /// say. This is the only thing entitled to call a file new -- numstat
+    /// alone cannot tell a created file from an appended one.
+    pub marks: HashMap<String, Mark>,
 }
 
 // --- time ---------------------------------------------------------------
@@ -147,6 +151,375 @@ pub fn classify(subject: &str) -> &'static str {
     "changed"
 }
 
+// --- what a file is, and which way it moved -----------------------------
+//
+// Everything here is derived from the path and the two churn numbers git
+// already returns. No model, no second git call. The register is the
+// digest's: it says what the log states and stops there. It names what a
+// file *is* by convention, and which way its lines *moved* -- never what the
+// code does, which is the one thing a path cannot tell you.
+
+/// numstat spells a rename `old => new`, or `src/{a.rs => b.rs}` where a
+/// prefix and suffix are shared. Only the destination is a real path, and
+/// only the destination is a valid pathspec.
+pub fn final_path(raw: &str) -> String {
+    if let Some(open) = raw.find('{') {
+        if let Some(rel) = raw[open..].find('}') {
+            let close = open + rel;
+            let inner = &raw[open + 1..close];
+            let dest = match inner.split_once(" => ") {
+                Some((_, to)) => to,
+                None => inner,
+            };
+            // A rename into or out of the root leaves an empty half, which
+            // would otherwise splice into a doubled separator.
+            return format!("{}{}{}", &raw[..open], dest, &raw[close + 1..]).replace("//", "/");
+        }
+    }
+    match raw.split_once(" => ") {
+        Some((_, to)) => to.to_string(),
+        None => raw.to_string(),
+    }
+}
+
+/// The first path segment is the closest thing to a subject area without
+/// knowing anything about the project.
+pub fn area(path: &str) -> String {
+    match path.split_once('/') {
+        Some((head, _)) => head.to_string(),
+        None => "(root)".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Test, Docs, Build, Config, Shader, Markup, Data, Asset, Source, Other,
+}
+
+impl Role {
+    /// One word, because it shares a row with the churn counts.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Role::Test => "test",
+            Role::Docs => "docs",
+            Role::Build => "build",
+            Role::Config => "config",
+            Role::Shader => "shader",
+            Role::Markup => "markup",
+            Role::Data => "data",
+            Role::Asset => "asset",
+            Role::Source => "source",
+            Role::Other => "file",
+        }
+    }
+}
+
+/// Ordered specific-to-generic, first match wins -- the same discipline as
+/// `KINDS`, for the same reason. Directory segments are compared whole and
+/// never as substrings: `contest/` ends in `test` and `src/latest.rs` starts
+/// with it, and substring matching would file both as tests. That is the
+/// `prefix`/`fix` trap one directory up.
+///
+/// Segments are consulted before the extension, which is what makes
+/// `.github/workflows/ci.yml` read as build rather than config.
+pub fn role(path: &str) -> Role {
+    let path = final_path(path);
+    let lower = path.to_lowercase();
+    let segments: Vec<&str> = lower.split('/').collect();
+    let file = *segments.last().unwrap_or(&"");
+    let stem = file.split('.').next().unwrap_or("");
+
+    // 1. The file's own name.
+    if stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file == "conftest.py"
+    {
+        return Role::Test;
+    }
+
+    // 2. Whole directory segments, outermost first, so tests/fixtures/big.json
+    //    is a test rather than data.
+    for seg in segments.iter().take(segments.len().saturating_sub(1)) {
+        match *seg {
+            "tests" | "test" | "spec" | "specs" | "__tests__" => return Role::Test,
+            "docs" | "doc" | "man" => return Role::Docs,
+            ".github" | "ci" | "tools" | "scripts" => return Role::Build,
+            "assets" | "res" | "static" => return Role::Asset,
+            "shaders" => return Role::Shader,
+            "migrations" | "fixtures" => return Role::Data,
+            _ => {}
+        }
+    }
+
+    // 3. Names that carry their role without an extension.
+    match stem {
+        "readme" | "changelog" | "license" | "licence" | "copying" | "contributing"
+        | "authors" | "notice" => return Role::Docs,
+        "makefile" | "dockerfile" | "justfile" | "cmakelists" | "vagrantfile" => {
+            return Role::Build
+        }
+        _ => {}
+    }
+    match file {
+        "cargo.toml" | "cargo.lock" | "package.json" | "package-lock.json" | "go.mod"
+        | "go.sum" | "pyproject.toml" | "requirements.txt" => return Role::Config,
+        _ => {}
+    }
+
+    // 4. A dotfile is configuration by convention; it has a name, not an
+    //    extension, so this must come before the extension table.
+    if file.starts_with('.') {
+        return Role::Config;
+    }
+
+    // 5. Extension.
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    match ext {
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "hpp"
+        | "cs" | "java" | "kt" | "rb" | "swift" | "lua" | "zig" | "hs" | "ml" | "php"
+        | "dart" | "scala" | "clj" | "ex" | "erl" | "f90" | "cob" => Role::Source,
+        "md" | "rst" | "adoc" | "txt" | "tex" => Role::Docs,
+        "toml" | "yaml" | "yml" | "json" | "ini" | "cfg" | "conf" | "lock" | "properties" => {
+            Role::Config
+        }
+        "ps1" | "sh" | "bat" | "cmd" | "mk" | "bazel" | "gradle" | "spec" => Role::Build,
+        "wgsl" | "glsl" | "hlsl" | "frag" | "vert" | "metal" | "shader" => Role::Shader,
+        "html" | "htm" | "css" | "scss" | "sass" | "xaml" | "svelte" | "vue" => Role::Markup,
+        "csv" | "tsv" | "sql" | "ndjson" | "parquet" => Role::Data,
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "ttf" | "otf" | "woff" | "woff2"
+        | "wav" | "ogg" | "mp3" | "glb" | "obj" | "pdf" => Role::Asset,
+        _ => Role::Other,
+    }
+}
+
+/// What `--summary` reported, when a source can report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Create,
+    Delete,
+    Rename,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Created, Deleted, Renamed, OnlyAdded, OnlyRemoved, Grew, Trimmed, Reworked, Unlined,
+}
+
+/// A mark is testimony and wins outright; without one, all that is left is
+/// the ratio of the two counts.
+pub fn shape(adds: i64, dels: i64, mark: Option<Mark>) -> Shape {
+    match mark {
+        Some(Mark::Create) => return Shape::Created,
+        Some(Mark::Delete) => return Shape::Deleted,
+        Some(Mark::Rename) => return Shape::Renamed,
+        None => {}
+    }
+    if adds == 0 && dels == 0 {
+        Shape::Unlined
+    } else if dels == 0 {
+        Shape::OnlyAdded
+    } else if adds == 0 {
+        Shape::OnlyRemoved
+    } else if adds >= dels * 3 {
+        Shape::Grew
+    } else if dels >= adds * 3 {
+        Shape::Trimmed
+    } else {
+        Shape::Reworked
+    }
+}
+
+impl Shape {
+    /// Two rules hold this table together, and both are about refusing to
+    /// say more than the numbers support.
+    ///
+    /// `OnlyAdded` never says "new". A `+35 −0` file is indistinguishable
+    /// from an append to a file that already existed, so only `Created` --
+    /// which can come from nowhere but `--summary` -- may use the word.
+    ///
+    /// `Unlined` never says "empty" or "untouched". numstat writes `-` for a
+    /// binary, which the parser reads as zero, so a swapped 4 MB texture and
+    /// a bare mode change arrive as the same pair of numbers.
+    pub fn motion(self) -> &'static str {
+        match self {
+            Shape::Created => "new",
+            Shape::Deleted => "deleted",
+            Shape::Renamed => "renamed",
+            Shape::OnlyAdded => "added to, nothing cut",
+            Shape::OnlyRemoved => "cut back only",
+            Shape::Grew => "mostly growth",
+            Shape::Trimmed => "mostly cut",
+            Shape::Reworked => "churned in place",
+            Shape::Unlined => "no lines moved — binary, rename or mode",
+        }
+    }
+}
+
+/// Composed rather than tabulated: a role word and a motion word, plus a
+/// handful of pairings where English does better than the two halves apart.
+/// Note that every override stays inside what the numbers license -- a test
+/// file with adds and no deletions really did gain cases.
+pub fn motion_for(role: Role, shape: Shape) -> &'static str {
+    match (role, shape) {
+        (Role::Test, Shape::Created) | (Role::Test, Shape::OnlyAdded) => "new cases",
+        (Role::Test, Shape::Deleted) | (Role::Test, Shape::OnlyRemoved) => "cases withdrawn",
+        (Role::Docs, Shape::OnlyAdded) => "more said",
+        (Role::Docs, Shape::Reworked) => "reworded",
+        (Role::Config, Shape::Reworked) => "retuned",
+        (Role::Asset, Shape::Unlined) | (Role::Data, Shape::Unlined) => "binary, swapped",
+        _ => shape.motion(),
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct FileNote {
+    pub path: String,
+    pub role: Role,
+    pub area: String,
+    pub shape: Shape,
+    pub adds: i64,
+    pub dels: i64,
+}
+
+impl FileNote {
+    /// The motion half alone, so a caller can tint the role tag separately.
+    pub fn motion(&self) -> &'static str {
+        motion_for(self.role, self.shape)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Portrait {
+    pub sentences: Vec<String>,
+    pub notes: Vec<FileNote>,
+}
+
+impl Detail {
+    /// The commit's own digest, in the register of `WeekDigest::sentences`:
+    /// counted, never generated. The only claim it makes about intent is
+    /// explicitly a claim about the *subject line*.
+    pub fn portrait(&self, commit: &Commit) -> Portrait {
+        let notes: Vec<FileNote> = self
+            .files
+            .iter()
+            .map(|(raw, adds, dels)| {
+                let path = final_path(raw);
+                let mark = self.marks.get(&path).or_else(|| self.marks.get(raw)).copied();
+                FileNote {
+                    role: role(&path),
+                    area: area(&path),
+                    shape: shape(*adds, *dels, mark),
+                    adds: *adds,
+                    dels: *dels,
+                    path,
+                }
+            })
+            .collect();
+
+        let mut out: Vec<String> = Vec::new();
+        let n = notes.len();
+
+        // A merge commit shows no diff at all under plain `git show`. Say so
+        // rather than rendering an empty portrait that reads like a bug.
+        if n == 0 {
+            out.push("No file diff — git shows none for this commit.".into());
+            return Portrait { sentences: out, notes };
+        }
+
+        // What.
+        let mut by_role: HashMap<&'static str, usize> = HashMap::new();
+        for f in &notes {
+            *by_role.entry(f.role.tag()).or_insert(0) += 1;
+        }
+        let mut roles: Vec<(&str, usize)> = by_role.into_iter().collect();
+        roles.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        if n == 1 {
+            let f = &notes[0];
+            out.push(format!(
+                "One file: {} in {}, {}.",
+                f.role.tag(),
+                f.area,
+                f.shape.motion()
+            ));
+        } else if roles.len() == 1 {
+            out.push(format!(
+                "{}, all {}. +{} −{}.",
+                plural(n, "file"),
+                roles[0].0,
+                self.additions,
+                self.deletions
+            ));
+        } else {
+            let listed: Vec<String> = roles
+                .iter()
+                .take(3)
+                .map(|(tag, count)| format!("{count} {tag}"))
+                .collect();
+            out.push(format!(
+                "{}: {}. +{} −{}.",
+                plural(n, "file"),
+                listed.join(", "),
+                self.additions,
+                self.deletions
+            ));
+        }
+
+        // Where. Ranked by the same rule as WeekDigest's areas, so the two
+        // screens never disagree about where the work landed.
+        let mut by_area: HashMap<String, usize> = HashMap::new();
+        for f in &notes {
+            *by_area.entry(f.area.clone()).or_insert(0) += 1;
+        }
+        let mut areas: Vec<(String, usize)> = by_area.into_iter().collect();
+        areas.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if areas.len() == 1 {
+            out.push(format!("All of it under {}.", areas[0].0));
+        } else {
+            out.push(format!(
+                "Across {}, heaviest in {} ({}).",
+                plural(areas.len(), "area"),
+                areas[0].0,
+                plural(areas[0].1, "file")
+            ));
+        }
+
+        // Weight.
+        let total = self.additions + self.deletions;
+        if n > 1 && total > 0 {
+            if let Some(top) = notes.iter().max_by_key(|f| f.adds + f.dels) {
+                if (top.adds + top.dels) * 5 >= total * 3 {
+                    out.push(format!(
+                        "{} carries most of it: +{} −{}.",
+                        top.path, top.adds, top.dels
+                    ));
+                }
+            }
+        }
+        if self.deletions == 0 && self.additions > 0 && n > 1 {
+            out.push("Nothing was removed anywhere.".into());
+        } else if self.deletions > self.additions {
+            out.push(format!(
+                "More left than arrived: −{} against +{}.",
+                self.deletions, self.additions
+            ));
+        }
+
+        // Subject. A claim about the subject line, never about the code.
+        let kind = classify(&commit.subject);
+        if kind != "changed" {
+            out.push(format!("The subject calls it {kind}."));
+        }
+
+        out.truncate(4);
+        Portrait { sentences: out, notes }
+    }
+}
+
 pub const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 pub const DAY_INITIALS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
 
@@ -222,13 +595,12 @@ impl WeekDigest {
         }
 
         // The first path segment is the closest thing to a subject area
-        // without knowing anything about the project.
+        // without knowing anything about the project. Through final_path so a
+        // renamed file lands in `src` rather than in an area literally named
+        // `src/{a.rs` -- one rule, shared with the per-commit portrait.
         let mut areas: HashMap<String, (i64, i64, usize)> = HashMap::new();
         for (path, (adds, dels)) in &files {
-            let area = match path.split_once('/') {
-                Some((head, _)) => head.to_string(),
-                None => "(root)".to_string(),
-            };
+            let area = area(&final_path(path));
             let e = areas.entry(area).or_insert((0, 0, 0));
             e.0 += adds;
             e.1 += dels;
@@ -381,6 +753,111 @@ mod tests {
     fn digest(commits: Vec<Commit>, back: i64) -> WeekDigest {
         WeekDigest::new("proj".into(), week_start(back), back, commits,
                         HashMap::new(), Some(0), false)
+    }
+
+    fn detail(files: &[(&str, i64, i64)]) -> Detail {
+        let mut d = Detail::default();
+        for (p, a, del) in files {
+            d.additions += a;
+            d.deletions += del;
+            d.files.push((p.to_string(), *a, *del));
+        }
+        d
+    }
+
+    #[test]
+    fn role_matches_whole_segments_not_substrings() {
+        // The prefix/fix trap, one directory up: "latest" ends in "test" and
+        // "contest" contains it. Neither is a test.
+        assert_eq!(role("src/latest.rs"), Role::Source);
+        assert_eq!(role("contest/main.rs"), Role::Source);
+        assert_eq!(role("tests/week.rs"), Role::Test);
+        assert_eq!(role("src/ui_test.rs"), Role::Test);
+    }
+
+    #[test]
+    fn role_reads_segments_before_extensions() {
+        // .yml alone would say config; the .github segment says build.
+        assert_eq!(role(".github/workflows/ci.yml"), Role::Build);
+        assert_eq!(role("config/app.yml"), Role::Config);
+        // A fixture under tests/ is a test, not data -- outermost wins.
+        assert_eq!(role("tests/fixtures/big.json"), Role::Test);
+    }
+
+    #[test]
+    fn role_knows_names_without_extensions() {
+        assert_eq!(role("README.md"), Role::Docs);
+        assert_eq!(role("LICENSE"), Role::Docs);
+        assert_eq!(role("Makefile"), Role::Build);
+        assert_eq!(role("Cargo.lock"), Role::Config);
+        assert_eq!(role(".gitignore"), Role::Config);
+    }
+
+    #[test]
+    fn only_added_is_never_called_new() {
+        // +35 -0 is indistinguishable from an append to an existing file.
+        // Only a --summary mark may say "new".
+        let s = shape(35, 0, None);
+        assert_eq!(s, Shape::OnlyAdded);
+        assert!(!s.motion().contains("new"));
+        assert_eq!(shape(35, 0, Some(Mark::Create)).motion(), "new");
+    }
+
+    #[test]
+    fn zero_churn_is_never_called_empty() {
+        // numstat writes "-" for a binary, which parses to zero. A swapped
+        // texture and a bare mode change arrive identically.
+        let s = shape(0, 0, None);
+        assert_eq!(s, Shape::Unlined);
+        let m = s.motion();
+        assert!(!m.contains("empty") && !m.contains("untouched"), "{m}");
+        assert!(m.contains("binary"));
+    }
+
+    #[test]
+    fn final_path_takes_the_destination_of_a_rename() {
+        assert_eq!(final_path("src/{a.rs => b.rs}"), "src/b.rs");
+        assert_eq!(final_path("old/a.rs => new/b.rs"), "new/b.rs");
+        assert_eq!(final_path("src/{ => sub}/a.rs"), "src/sub/a.rs");
+        assert_eq!(final_path("plain.rs"), "plain.rs");
+        // And the area follows from the destination, not the brace form.
+        assert_eq!(area(&final_path("src/{a.rs => b.rs}")), "src");
+    }
+
+    #[test]
+    fn portrait_says_plainly_when_there_is_no_diff() {
+        // A merge commit shows no numstat at all under plain `git show`.
+        let p = Detail::default().portrait(&commit("Merge branch 'main'", 0));
+        assert_eq!(p.notes.len(), 0);
+        assert!(p.sentences[0].contains("No file diff"), "{:?}", p.sentences);
+    }
+
+    #[test]
+    fn portrait_counts_roles_and_areas() {
+        let d = detail(&[
+            ("src/ui.rs", 40, 10),
+            ("src/model.rs", 12, 3),
+            ("tests/week.rs", 20, 0),
+            ("README.md", 2, 1),
+        ]);
+        let p = d.portrait(&commit("Add the detail portrait", 0));
+        assert_eq!(p.notes.len(), 4);
+        assert_eq!(p.notes[0].role, Role::Source);
+        assert_eq!(p.notes[2].role, Role::Test);
+        assert!(p.sentences[0].starts_with("4 files:"), "{:?}", p.sentences);
+        // Three areas: src, tests, (root) -- heaviest is src with two files.
+        assert!(p.sentences[1].contains("heaviest in src"), "{:?}", p.sentences);
+        assert!(p.sentences.len() <= 4);
+    }
+
+    #[test]
+    fn portrait_claims_only_what_the_subject_says() {
+        let d = detail(&[("src/a.rs", 1, 1)]);
+        let p = d.portrait(&commit("Fix the broken parser", 0));
+        assert!(p.sentences.iter().any(|s| s == "The subject calls it fixed."));
+        // A subject with no recognised kind makes no claim at all.
+        let q = d.portrait(&commit("Wednesday", 0));
+        assert!(!q.sentences.iter().any(|s| s.contains("subject calls it")));
     }
 
     #[test]

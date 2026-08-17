@@ -22,7 +22,7 @@ git-history -h              usage
 | `m` | narrate with a local model, if one is running |
 | `/` | filter |
 | `esc` | back |
-| `q` | quit |
+| `q` | back one frame; quits only at the repo list |
 
 ## Offline
 

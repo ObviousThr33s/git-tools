@@ -118,15 +118,42 @@ impl LocalSource {
         let mut d = Detail::default();
         for line in raw.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != 3 {
+            if parts.len() == 3 {
+                // "-" marks a binary file; count it as zero rather than failing.
+                let a: i64 = parts[0].parse().unwrap_or(0);
+                let del: i64 = parts[1].parse().unwrap_or(0);
+                d.additions += a;
+                d.deletions += del;
+                d.files.push((parts[2].to_string(), a, del));
                 continue;
             }
-            // "-" marks a binary file; count it as zero rather than failing.
-            let a: i64 = parts[0].parse().unwrap_or(0);
-            let del: i64 = parts[1].parse().unwrap_or(0);
-            d.additions += a;
-            d.deletions += del;
-            d.files.push((parts[2].to_string(), a, del));
+            // --summary lines carry no tabs, so they fall past the arm above
+            // and land here. They are the only testimony that a file was
+            // created rather than merely appended to; numstat alone cannot
+            // tell those apart, and the portrait refuses to guess.
+            let t = line.trim_start();
+            let (mark, rest) = if let Some(r) = t.strip_prefix("create mode ") {
+                (Mark::Create, r)
+            } else if let Some(r) = t.strip_prefix("delete mode ") {
+                (Mark::Delete, r)
+            } else if let Some(r) = t.strip_prefix("rename ") {
+                (Mark::Rename, r)
+            } else {
+                continue;
+            };
+            let path = match mark {
+                // "100644 some/path" -- a path may contain spaces, so split once.
+                Mark::Create | Mark::Delete => match rest.split_once(' ') {
+                    Some((_, p)) => p,
+                    None => continue,
+                },
+                // "src/{a.rs => b.rs} (95%)" -- drop the similarity score.
+                Mark::Rename => match rest.rfind(" (") {
+                    Some(i) => &rest[..i],
+                    None => rest,
+                },
+            };
+            d.marks.insert(final_path(path.trim()), mark);
         }
         d
     }
@@ -223,7 +250,12 @@ impl Source for LocalSource {
 
     fn detail(&self, repo: &str, commit: &Commit) -> Result<Detail> {
         let path = self.path_for(repo);
-        let raw = Self::run(&path, &["show", "--numstat", "--format=", &commit.sha])?;
+        // --summary rides along on the same invocation: it costs no extra
+        // process and is what lets a created file be called new truthfully.
+        let raw = Self::run(
+            &path,
+            &["show", "--numstat", "--summary", "--format=", &commit.sha],
+        )?;
         Ok(Self::numstat(&raw))
     }
 
@@ -461,10 +493,25 @@ impl Source for GitHubSource {
                     .collect()
             })
             .unwrap_or_default();
+        // The API states outright what --summary has to be parsed out of on
+        // disk, so this path can mark files without a second request.
+        let mut marks = std::collections::HashMap::new();
+        if let Some(arr) = data.get("files").and_then(|f| f.as_array()) {
+            for f in arr {
+                let mark = match s(f, "status").as_str() {
+                    "added" => Mark::Create,
+                    "removed" => Mark::Delete,
+                    "renamed" => Mark::Rename,
+                    _ => continue,
+                };
+                marks.insert(final_path(&s(f, "filename")), mark);
+            }
+        }
         Ok(Detail {
             additions: stats.get("additions").and_then(|v| v.as_i64()).unwrap_or(0),
             deletions: stats.get("deletions").and_then(|v| v.as_i64()).unwrap_or(0),
             files,
+            marks,
         })
     }
 

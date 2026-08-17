@@ -14,6 +14,8 @@
 //! Dependencies are vendored, so `cargo build --offline` works from a cold
 //! machine with the network unplugged.
 
+#[cfg(feature = "window")]
+mod gpu;
 mod llm;
 mod model;
 mod sigil;
@@ -45,6 +47,10 @@ fn usage() -> String {
   -u USER       force GitHub lookup for USER  (the only networked mode)
   --check       print what was found and this week's digest, then exit
   --no-model    skip probing loopback for a local model
+  -w, --window  open in a window instead of the terminal; the text grid is
+                recut as you drag the frame, so the view reflows to the borders
+  --vulkan      with --window, force the Vulkan adapter rather than the
+                machine's default (DX12 on most Windows boxes)
   -h            this message
 
   Local repositories are found up to three directories deep.
@@ -163,6 +169,27 @@ fn main() {
     } else {
         llm::detect()
     };
+
+    // The window path never touches the console, so it must not init ratatui's
+    // terminal at all -- doing so would leave a raw-mode console behind it.
+    if args.iter().any(|a| a == "-w" || a == "--window") {
+        #[cfg(feature = "window")]
+        {
+            let prefs = gpu::Prefs { vulkan: args.iter().any(|a| a == "--vulkan") };
+            if let Err(e) = gpu::run(source, repos, narrator, prefs) {
+                eprintln!("\n  ✕ {e}\n");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "window"))]
+        {
+            eprintln!(
+                "\n  ✕ this build has no window.\n    rebuild it with:  cargo build --release --features window\n"
+            );
+            std::process::exit(1);
+        }
+    }
 
     let mut terminal = ratatui::init();
     let result = ui::App::new(source, repos, narrator).run(&mut terminal);
