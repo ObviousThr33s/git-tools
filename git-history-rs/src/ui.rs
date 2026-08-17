@@ -5,10 +5,12 @@
 //! and every widget measures text in display cells rather than bytes. What
 //! remains here is what the tool actually decides -- what to show, and when.
 
-use crate::llm::{Narration, Narrator};
+use crate::llm::{CommitNote, Narration, Narrator};
 use crate::model::*;
 use crate::sigil;
-use crate::source::{Source, SourceError};
+use crate::source::{
+    Source, SourceError, PATCH_FILES, PATCH_GATE_FILES, PATCH_GATE_LINES,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::Terminal;
@@ -91,6 +93,8 @@ pub struct DetailView {
     /// Built once when the screen opens, never in draw -- draw runs on every
     /// keystroke, and this is pure work over a fixed input.
     pub portrait: Option<Portrait>,
+    pub note: Option<Result<CommitNote, String>>,
+    pub describing: bool,
     pub scroll: u16,
 }
 
@@ -140,6 +144,7 @@ pub enum Action {
     OpenCommits(String),
     OpenWeek(String),
     OpenDetail(usize),
+    Describe,
     StepWeek(i64),
     Narrate,
     PageCommits,
@@ -258,6 +263,57 @@ impl App {
                     }
                 }
             }
+            Action::Describe => {
+                let Some(narrator) = self.narrator.clone() else {
+                    self.status = Some(
+                        "no local model found -- start ollama or llama-server".into(),
+                    );
+                    return Ok(());
+                };
+                // Clone off the stack and let the borrow drop: source.patch
+                // needs &self.source while stack.last_mut holds &mut self.
+                let Some(Screen::Detail(d)) = self.stack.last() else {
+                    return Ok(());
+                };
+                let Some(detail) = d.detail.clone() else {
+                    self.status = Some("no diff to describe".into());
+                    return Ok(());
+                };
+                let (repo, commit) = (d.repo.clone(), d.commit.clone());
+
+                // The gate is free -- the churn is already in hand. A commit
+                // this big is a lockfile or a vendor drop, and its diff would
+                // be spent on noise.
+                let heavy = detail.additions + detail.deletions > PATCH_GATE_LINES
+                    || detail.files.len() > PATCH_GATE_FILES;
+                let patch = if heavy {
+                    String::new()
+                } else {
+                    let mut top = detail.files.clone();
+                    top.sort_by_key(|(_, a, del)| -(a + del));
+                    let names: Vec<String> = top
+                        .iter()
+                        .take(PATCH_FILES)
+                        .map(|(p, _, _)| final_path(p))
+                        .collect();
+                    // A diff that will not come is a thinner description,
+                    // never a failure.
+                    self.source.patch(&repo, &commit, &names).unwrap_or_default()
+                };
+
+                if let Some(Screen::Detail(d)) = self.stack.last_mut() {
+                    d.describing = true;
+                }
+                self.splash(
+                    terminal,
+                    &format!("asking {} about {}…", narrator.model, commit.short()),
+                )?;
+                let note = narrator.describe_commit(&repo, &commit, &detail, &patch);
+                if let Some(Screen::Detail(d)) = self.stack.last_mut() {
+                    d.note = Some(note);
+                    d.describing = false;
+                }
+            }
             Action::Narrate => {
                 let Some(narrator) = self.narrator.clone() else {
                     self.status = Some(
@@ -288,6 +344,8 @@ impl App {
                         commit,
                         detail,
                         portrait,
+                        note: None,
+                        describing: false,
                         scroll: 0,
                     }));
                 }
@@ -348,7 +406,11 @@ impl App {
         match self.stack.last_mut() {
             Some(Screen::Repos(r)) => Self::handle_repos(r, key),
             Some(Screen::Commits(c)) => Self::handle_commits(c, key),
-            Some(Screen::Detail(d)) => Self::handle_scroll(&mut d.scroll, key),
+            // m asks the model here too: one key, one concept across screens.
+            Some(Screen::Detail(d)) => match key.code {
+                KeyCode::Char('m') | KeyCode::Char('M') => Action::Describe,
+                _ => Self::handle_scroll(&mut d.scroll, key),
+            },
             Some(Screen::Week(w)) => {
                 let scroll = &mut w.scroll;
                 match key.code {
@@ -506,7 +568,7 @@ impl App {
         match self.stack.last_mut() {
             Some(Screen::Repos(r)) => draw_repos(f, area, r, &label),
             Some(Screen::Commits(c)) => draw_commits(f, area, c),
-            Some(Screen::Detail(d)) => draw_detail(f, area, d),
+            Some(Screen::Detail(d)) => draw_detail(f, area, d, has_model),
             Some(Screen::Week(w)) => draw_week(f, area, w, has_model),
             None => {}
         }
@@ -738,7 +800,7 @@ fn draw_commits(f: &mut Frame, area: Rect, c: &mut CommitList) {
     c.state = state;
 }
 
-fn draw_detail(f: &mut Frame, area: Rect, d: &mut DetailView) {
+fn draw_detail(f: &mut Frame, area: Rect, d: &mut DetailView, has_model: bool) {
     let sub = match &d.detail {
         None => "no diff".to_string(),
         Some(det) => format!(
@@ -813,14 +875,60 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut DetailView) {
         }
     }
 
+    // Generated prose lives below everything counted, behind a rule, in the
+    // colour this program already reserves for "generated, not counted".
+    match &d.note {
+        Some(Ok(n)) => {
+            let mark = if n.reused { '·' } else { '▸' };
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                format!("── {mark} described by {} ──", n.model),
+                dim(),
+            )));
+            text.push(Line::from(""));
+            for line in n.text.lines() {
+                text.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(WARN),
+                )));
+            }
+            text.push(Line::from(""));
+            // A reader must be able to tell at a glance whether the model
+            // read code or only file names.
+            let seen = if n.saw_patch {
+                "generated text; it read the diff. The lines above are counted from the log."
+            } else {
+                "generated text; it saw only paths and churn, not the diff. \
+                 The lines above are counted from the log."
+            };
+            text.push(Line::from(Span::styled(seen.to_string(), dim())));
+        }
+        Some(Err(e)) => {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                format!("model: {e}"),
+                Style::default().fg(ERRC),
+            )));
+        }
+        None if d.describing => {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled("asking the model…", dim())));
+        }
+        None => {}
+    }
+
     let total = text.len() as u16;
     d.scroll = d.scroll.min(total.saturating_sub(1));
     f.render_widget(
         Paragraph::new(text).scroll((d.scroll, 0)).wrap(Wrap { trim: false }),
         rows[0],
     );
-    hint_bar(f, rows[1], "↑↓ scroll   esc/q back",
-             &format!("{}/{}", d.scroll + 1, total));
+    let hint = if has_model {
+        "↑↓ scroll   m describe   esc/q back"
+    } else {
+        "↑↓ scroll   esc/q back"
+    };
+    hint_bar(f, rows[1], hint, &format!("{}/{}", d.scroll + 1, total));
 }
 
 fn draw_week(f: &mut Frame, area: Rect, w: &mut WeekView, has_model: bool) {

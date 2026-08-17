@@ -31,9 +31,48 @@ pub trait Source {
     fn commits(&self, repo: &str, page: usize) -> Result<(Vec<Commit>, bool)>;
     fn detail(&self, repo: &str, commit: &Commit) -> Result<Detail>;
     fn week(&self, repo: &str, start: DateTime<Local>, back: i64) -> Result<WeekDigest>;
+
+    /// Diff text for one commit, restricted to the named files.
+    ///
+    /// Provided rather than required: a source that cannot produce one
+    /// cheaply says nothing, and the caller falls back to describing from
+    /// paths and churn. An empty string is a valid answer, never an error.
+    fn patch(&self, _repo: &str, _commit: &Commit, _files: &[String]) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
+/// Cut at the last newline before the limit -- never at a byte index, which
+/// would panic off a UTF-8 boundary, and never mid-line, which would hand a
+/// reader half a statement.
+pub fn cap_text(text: String, limit: usize) -> String {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = text[..end].rfind('\n').unwrap_or(end);
+    let mut out = text[..cut].to_string();
+    out.push_str("\n[… truncated]\n");
+    out
 }
 
 pub const PAGE: usize = 100;
+
+/// Bytes of diff text a description may see. Enough for the shape of a
+/// change, far short of a whole feature branch.
+pub const PATCH_CAP: usize = 16 * 1024;
+
+/// Files a description may open. The rest are described from their names.
+pub const PATCH_FILES: usize = 12;
+
+/// Above this, skip the diff entirely and describe from paths and churn.
+/// Not hypothetical: one commit in this very repository is 4,700 lines, of
+/// which 2,470 are a lockfile.
+pub const PATCH_GATE_LINES: i64 = 4_000;
+pub const PATCH_GATE_FILES: usize = 60;
 
 /// Projects are not all checked out at the same level: a working root may
 /// hold containers of repositories, and may be a repository itself. Three
@@ -257,6 +296,44 @@ impl Source for LocalSource {
             &["show", "--numstat", "--summary", "--format=", &commit.sha],
         )?;
         Ok(Self::numstat(&raw))
+    }
+
+    fn patch(&self, repo: &str, commit: &Commit, files: &[String]) -> Result<String> {
+        if files.is_empty() {
+            return Ok(String::new());
+        }
+        let path = self.path_for(repo);
+        let mut args: Vec<&str> = vec![
+            "--no-pager",
+            "show",
+            &commit.sha,
+            "--format=",
+            "--patch",
+            // The @@ header already names the enclosing item, so context
+            // lines are mostly bytes without signal.
+            "--unified=0",
+            "--no-color",
+            // Not tidiness. A .gitattributes textconv filter or a configured
+            // external difftool would RUN A PROGRAM out of a repository this
+            // tool only ever meant to read -- and it reads whatever clones
+            // happen to sit on the working root.
+            "--no-ext-diff",
+            "--no-textconv",
+            // Literal paths remain valid pathspecs; a rename spelling does not.
+            "--no-renames",
+            // A deletion's body is the whole of the old file: pure noise.
+            "--diff-filter=ACMR",
+            "--",
+        ];
+        let specs: Vec<String> = files
+            .iter()
+            // A brace-form rename is not a pathspec, and :(literal) keeps a
+            // path containing glob characters from being read as a pattern.
+            .filter(|f| !f.contains(" => "))
+            .map(|f| format!(":(literal){f}"))
+            .collect();
+        args.extend(specs.iter().map(|s| s.as_str()));
+        Ok(cap_text(Self::run(&path, &args)?, PATCH_CAP))
     }
 
     /// On disk the file statistics are free, so unlike the API path this
@@ -513,6 +590,36 @@ impl Source for GitHubSource {
             files,
             marks,
         })
+    }
+
+    fn patch(&self, repo: &str, commit: &Commit, files: &[String]) -> Result<String> {
+        if files.is_empty() {
+            return Ok(String::new());
+        }
+        // One request, on a key the reader pressed -- never on screen entry.
+        let data = self.get(
+            &format!("/repos/{}/{}/commits/{}", self.user, repo, commit.sha),
+            &[],
+        )?;
+        let wanted: std::collections::HashSet<&str> = files.iter().map(|f| f.as_str()).collect();
+        let mut out = String::new();
+        if let Some(arr) = data.get("files").and_then(|f| f.as_array()) {
+            for f in arr {
+                let name = s(f, "filename");
+                if !wanted.contains(name.as_str()) {
+                    continue;
+                }
+                // The API omits `patch` for very large files and past 300
+                // files in a commit. A missing hunk is silence, not an error
+                // -- which is why the caller reports what actually arrived
+                // rather than what it asked for.
+                let Some(p) = f.get("patch").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                out.push_str(&format!("--- {name}\n{p}\n"));
+            }
+        }
+        Ok(cap_text(out, PATCH_CAP))
     }
 
     /// Per-file churn is deliberately not fetched: the API bills a request

@@ -19,7 +19,7 @@ git-history -h              usage
 | `⏎` | open |
 | `w` | the week |
 | `p` `n` | step the week back / forward |
-| `m` | narrate with a local model, if one is running |
+| `m` | narrate the week, or describe the commit, if a local model is running |
 | `/` | filter |
 | `esc` | back |
 | `q` | back one frame; quits only at the repo list |
