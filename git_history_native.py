@@ -270,6 +270,12 @@ LANGUAGE_TINT = {
 # report. Chosen to stay legible on both dark and light terminals.
 NEUTRAL_TINTS = (39, 79, 141, 209, 214, 105, 45, 168)
 
+# Commits need a wider spread than the eight neutrals. A project's mark is one
+# colour for a whole list; commits sit next to each other, and on eight tints
+# neighbours collide often enough to read as related when they are not.
+COMMIT_TINTS = (39, 45, 51, 79, 84, 114, 141, 147,
+                168, 175, 203, 209, 214, 220, 105, 116)
+
 
 def sigil_tint(name, language=None):
     if language:
@@ -278,6 +284,13 @@ def sigil_tint(name, language=None):
             return hit
     seed = hashlib.sha256(("tint:" + name).encode("utf-8")).digest()
     return NEUTRAL_TINTS[seed[0] % len(NEUTRAL_TINTS)]
+
+
+def commit_tint(sha):
+    """A commit's own colour, from its sha. No language to consult, and a sha
+    is already uniform, so the tint comes straight from the palette."""
+    seed = hashlib.sha256(("commit:" + sha).encode("utf-8")).digest()
+    return COMMIT_TINTS[seed[0] % len(COMMIT_TINTS)]
 
 
 def sigil_grid(name, size=SIGIL_SIZE):
@@ -294,10 +307,14 @@ def sigil_grid(name, size=SIGIL_SIZE):
     return grid
 
 
-def sigil_lines(name, language=None, size=SIGIL_SIZE):
-    """Render the mark as colored terminal rows, two grid rows per line."""
+def sigil_lines(name, language=None, size=SIGIL_SIZE, color=None):
+    """Render the mark as colored terminal rows, two grid rows per line.
+
+    `color` overrides the tint the name would earn, so a commit can carry its
+    own colour while the figure stays a pure function of what seeds it."""
     grid = sigil_grid(name, size)
-    tint = _c(f"\033[38;5;{sigil_tint(name, language)}m")
+    code = color if color is not None else sigil_tint(name, language)
+    tint = _c(f"\033[38;5;{code}m")
     out = []
     for y in range(0, size, 2):
         top = grid[y]
@@ -1163,8 +1180,12 @@ class CommitScreen(Screen):
                      f"{DIM}{commit.short}  {when}{RESET} ", inner)
 
     def side_panel(self, commit, rows, width):
+        """Every commit gets its own mark. Seeded by the sha, not the repo:
+        the repo's figure would be the same shape on every row, saying
+        nothing about which commit you are standing on."""
         gap = " " * max(0, (width - SIGIL_W) // 2)
-        lines = [""] + [gap + art for art in sigil_lines(self.repo)]
+        art_lines = sigil_lines(commit.sha, color=commit_tint(commit.sha))
+        lines = [""] + [gap + art for art in art_lines]
         lines.append("")
         lines.append(f"{BOLD}{fit(commit.short, width)}{RESET}")
         if commit.author:

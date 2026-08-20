@@ -73,6 +73,14 @@ const LANGUAGE_TINT: &[(&str, u8)] = &[
 
 const NEUTRAL_TINTS: [u8; 8] = [39, 79, 141, 209, 214, 105, 45, 168];
 
+/// Commits get their own spread of hues. A project's mark carries one colour
+/// for the whole list, so its commits need a wider palette than the eight
+/// neutrals -- otherwise neighbouring commits land on the same tint often
+/// enough to read as related when they are not.
+const COMMIT_TINTS: [u8; 16] = [
+    39, 45, 51, 79, 84, 114, 141, 147, 168, 175, 203, 209, 214, 220, 105, 116,
+];
+
 pub fn tint(name: &str, language: &str) -> Color {
     let lang = language.trim().to_lowercase();
     if let Some((_, code)) = LANGUAGE_TINT.iter().find(|(l, _)| *l == lang) {
@@ -80,6 +88,13 @@ pub fn tint(name: &str, language: &str) -> Color {
     }
     let digest = Sha256::digest(format!("tint:{name}").as_bytes());
     Color::Indexed(NEUTRAL_TINTS[digest[0] as usize % NEUTRAL_TINTS.len()])
+}
+
+/// A commit's own colour, from its sha. Language means nothing here and the
+/// sha is already uniform, so the tint is drawn straight from the palette.
+pub fn commit_tint(sha: &str) -> Color {
+    let digest = Sha256::digest(format!("commit:{sha}").as_bytes());
+    Color::Indexed(COMMIT_TINTS[digest[0] as usize % COMMIT_TINTS.len()])
 }
 
 #[cfg(test)]
@@ -127,6 +142,23 @@ mod tests {
         for (name, expected) in cases {
             assert_eq!(lines(name).join("/"), *expected, "mark drifted for {name}");
         }
+    }
+
+    #[test]
+    fn commit_tints_are_stable_and_spread() {
+        assert_eq!(commit_tint("521d273"), commit_tint("521d273"));
+        let shas = [
+            "521d273", "9f7e237", "e990e30", "aaee4b1", "35d71ce", "0f1e2d3",
+            "c0ffee1", "deadbe2",
+        ];
+        let distinct: std::collections::HashSet<_> =
+            shas.iter().map(|s| commit_tint(s)).collect();
+        assert!(distinct.len() >= shas.len() - 2, "commit tints clump together");
+    }
+
+    #[test]
+    fn a_commit_carries_its_own_mark() {
+        assert_ne!(lines("git-history-rs"), lines("521d2733a"));
     }
 
     #[test]

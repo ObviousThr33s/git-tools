@@ -620,14 +620,15 @@ fn hint_bar(f: &mut Frame, area: Rect, hint: &str, counter: &str) {
     );
 }
 
-/// The mark, over the facts that identify the selection.
-fn sigil_panel(name: &str, language: &str, facts: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    let colour = sigil::tint(name, language);
+/// The mark, over the facts that identify the selection. `seed` decides the
+/// figure and `colour` the tint, so a commit can carry its own of each while
+/// a project keeps the mark its name earns.
+fn sigil_panel(seed: &str, colour: Color, facts: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let gap = " ".repeat(
         (PANEL_W as usize).saturating_sub(sigil::WIDTH) / 2,
     );
     let mut lines = vec![Line::from("")];
-    for art in sigil::lines(name) {
+    for art in sigil::lines(seed) {
         lines.push(Line::from(Span::styled(
             format!("{gap}{art}"),
             Style::default().fg(colour),
@@ -707,7 +708,11 @@ fn draw_repos(f: &mut Frame, area: Rect, r: &mut RepoList, label: &str) {
             }
             facts.push(Line::from(""));
             facts.push(Line::from(Span::styled(stamp(repo.updated), dim())));
-            let text = sigil_panel(&repo.name, &repo.subtitle, facts);
+            let text = sigil_panel(
+                &repo.name,
+                sigil::tint(&repo.name, &repo.subtitle),
+                facts,
+            );
             f.render_widget(
                 Paragraph::new(text).block(Block::default().borders(Borders::LEFT).border_style(dim())),
                 panel,
@@ -782,7 +787,9 @@ fn draw_commits(f: &mut Frame, area: Rect, c: &mut CommitList) {
                 Line::from(Span::styled(commit.author.clone(), dim())),
                 Line::from(Span::styled(ago(commit.date), dim())),
             ];
-            let text = sigil_panel(&c.repo, "", facts);
+            // Seeded by the sha, not the repo: in a list of commits the
+            // repo's own mark would be the same figure on every row.
+            let text = sigil_panel(&commit.sha, sigil::commit_tint(&commit.sha), facts);
             f.render_widget(
                 Paragraph::new(text)
                     .block(Block::default().borders(Borders::LEFT).border_style(dim())),
